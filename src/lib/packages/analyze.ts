@@ -3,6 +3,8 @@ import type { Severity } from '@/types';
 import { supabaseAdmin } from '@/lib/supabase';
 import { PACKAGE_NAME, createLimiter, fetchPackument, checkTyposquat } from '@/lib/npm/registry';
 import { runDiffTier } from './diff';
+import { runSandboxTier } from './sandbox';
+import { reviewDiff, shouldLower, type LlmReview } from './review';
 import {
   analyzeVersion, youngDependencySignal,
   type NpmVersionDoc,
@@ -19,8 +21,13 @@ import { resolveCooldown, formatAge, type CooldownOptions } from './cooldown';
  * Tier 1 is registry metadata + OSV. A version that scores at or above the warn
  * threshold is escalated to tier 2, the tarball diff (diff.ts): its files are
  * compared with the previous version's and scanned as text, never executed.
- * The LLM review and sandbox tiers (#43/#45) will hang off the same rule, see
- * needsEscalation() below.
+ * The same versions then go to the sandbox (sandbox.ts, #45): they are run in a
+ * throwaway Docker container and what they do is recorded. It is optional, since
+ * it needs a separate runner service. Last comes the LLM review (review.ts, #43),
+ * which reads the code behind the diff signals as a tiebreaker: it is recorded on
+ * the verdict, can never raise it, and can lower `warn` to `allow` only in the
+ * narrow case shouldLower() allows (never against a sandbox finding). Both hang
+ * off the same rule, see needsEscalation() below.
  *
  * CACHING. Published npm versions are immutable, so a verdict is looked up by
  * (name, version) *before* any network call: a repeat call is one DB read. A
@@ -47,6 +54,9 @@ export type VerdictSignalType =
   | 'osv_malicious' | 'osv_advisory'
   // Tarball-diff tier (#39)
   | 'diff_rule' | 'diff_install_script' | 'diff_new_files' | 'diff_skipped' | 'archive_anomaly'
+  // Sandbox tier (#45)
+  | 'sandbox_honeypot_read' | 'sandbox_token_exfil' | 'sandbox_network' | 'sandbox_process'
+  | 'sandbox_sensitive_read' | 'sandbox_clean' | 'sandbox_skipped'
   // Cooldown / allowlist tier (#42)
   | 'too_new';
 
@@ -69,8 +79,8 @@ export interface PackageVerdict {
   verdict: Verdict;
   score: number;
   signals: VerdictSignal[];
-  /** How far the analysis went: registry metadata + OSV, or also the tarball diff. */
-  tierReached: 'metadata' | 'diff';
+  /** How far the analysis went: registry metadata + OSV, then the tarball diff, then the sandbox run. */
+  tierReached: 'metadata' | 'diff' | 'sandbox';
   analyzedAt: string;
   /** True when this came from package_verdicts instead of a fresh analysis. */
   fromCache: boolean;
@@ -80,6 +90,12 @@ export interface PackageVerdict {
    * "clean", so a verdict with failures is never `allow` (see analyzePackage).
    */
   sourceFailures: string[];
+  /**
+   * The LLM's read of the diff (#43). Absent when the step did not run: nothing
+   * to review, or no AI key configured. A failed review is recorded here as
+   * `status: 'failed'` rather than hidden.
+   */
+  review?: LlmReview;
   /**
    * The allowlist entry that matched this package, if any (#42).
    * Present only when the caller passed a `CooldownOptions.allow` list and this
@@ -112,7 +128,8 @@ export type { CooldownOptions } from './cooldown';
 // A confirmed OSV malicious-package match (a `MAL-` id, or any advisory
 // tagged CWE-506 "Embedded Malicious Code") forces `block` outright,
 // regardless of score — that is not a heuristic, it is a direct report of
-// known-malicious code.
+// known-malicious code. So does the sandbox catching a package reading the fake
+// credentials it planted, or passing them on: observed behaviour, not a guess.
 // A verdict that would be `allow` but had a source fail is `warn` instead: a
 // package that could not be fully checked is not one we can vouch for.
 const SEVERITY_WEIGHT: Record<Severity, number> = { critical: 15, high: 8, medium: 4, low: 1, info: 0 };
@@ -121,7 +138,7 @@ const WARN_SCORE = 8;
 const MAX_SCORED_ADVISORIES = 3;
 const MAX_ADVISORY_SCORE = SEVERITY_WEIGHT.medium;
 
-function scoreOf(signals: VerdictSignal[]): number {
+export function scoreOf(signals: VerdictSignal[]): number {
   let score = 0;
   let advisories = 0;
   for (const s of signals) {
@@ -131,8 +148,11 @@ function scoreOf(signals: VerdictSignal[]): number {
   return score + Math.min(advisories, MAX_ADVISORY_SCORE);
 }
 
-function verdictFor(signals: VerdictSignal[], score: number, failures: string[]): Verdict {
-  if (signals.some((s) => s.type === 'osv_malicious')) return 'block';
+/** Signals that are proof rather than suspicion: any one of them is a `block`. */
+const HARD_SIGNALS = new Set<VerdictSignalType>(['osv_malicious', 'sandbox_honeypot_read', 'sandbox_token_exfil']);
+
+export function verdictFor(signals: VerdictSignal[], score: number, failures: string[]): Verdict {
+  if (signals.some((s) => HARD_SIGNALS.has(s.type))) return 'block';
   if (score >= BLOCK_SCORE) return 'block';
   if (score >= WARN_SCORE || failures.length > 0) return 'warn';
   return 'allow';
@@ -222,14 +242,16 @@ function osvSignals(vulns: OSVVuln[]): VerdictSignal[] {
 
 function rowToVerdict(row: {
   name: string; version: string; integrity: string; verdict: Verdict; score: number;
-  signals: VerdictSignal[]; tier_reached: string; analyzed_at: string;
+  signals: VerdictSignal[]; tier_reached: string; analyzed_at: string; review?: LlmReview | null;
 }): PackageVerdict {
   return {
     name: row.name, version: row.version, integrity: row.integrity,
     verdict: row.verdict, score: row.score, signals: row.signals,
-    tierReached: row.tier_reached === 'diff' ? 'diff' : 'metadata', analyzedAt: row.analyzed_at,
+    tierReached: row.tier_reached === 'sandbox' || row.tier_reached === 'diff' ? row.tier_reached : 'metadata',
+    analyzedAt: row.analyzed_at,
     // Only complete verdicts are ever written, so a cached one had no failed source
     fromCache: true, sourceFailures: [],
+    ...(row.review ? { review: row.review } : {}),
   };
 }
 
@@ -261,6 +283,8 @@ async function writeCache(v: PackageVerdict): Promise<void> {
       name: v.name, version: v.version, integrity: v.integrity,
       verdict: v.verdict, score: v.score, signals: v.signals,
       tier_reached: v.tierReached, analyzed_at: v.analyzedAt,
+      // Only sent when there is one, so caching still works before the `review` column is migrated
+      ...(v.review ? { review: v.review } : {}),
     }, { onConflict: 'name,version,integrity' });
     if (error) console.warn(`package_verdicts write failed (${v.name}@${v.version}):`, error.message);
   } catch (err) {
@@ -273,9 +297,10 @@ async function writeCache(v: PackageVerdict): Promise<void> {
 /**
  * Escalation rule (#27 scope): only a version that scored above the `allow`
  * threshold here is worth the cost of the diff, LLM and sandbox tiers
- * (#39/#43/#45). Those tiers don't exist yet — this is the hook they'll
- * call once they do, so the rule lives in one place instead of each of
- * them re-deriving "is this verdict bad enough to look closer at".
+ * (#39/#43/#45). The diff and sandbox tiers apply the same score threshold
+ * inline; the LLM tier (#43) doesn't exist yet and will call this hook, so the
+ * rule lives in one place instead of each tier re-deriving "is this verdict
+ * bad enough to look closer at".
  */
 export function needsEscalation(v: PackageVerdict): boolean {
   return v.verdict !== 'allow';
@@ -415,34 +440,63 @@ export async function analyzePackage(
     else signals.push(...osvSignals(vulns));
 
     // Tier 2, the tarball diff, only for versions the metadata tier already
-    // flagged. A confirmed-malicious version needs no further proof, and one npm
-    // no longer serves has no tarball to read.
+    // flagged (the sandbox and LLM review below it run for those same versions).
+    // A confirmed-malicious version needs no further proof, and one npm no longer
+    // serves has no tarball to read.
     let tierReached: PackageVerdict['tierReached'] = 'metadata';
+    let review: LlmReview | undefined;
     if (pk && doc && scoreOf(signals) >= WARN_SCORE && !signals.some((s) => s.type === 'osv_malicious')) {
       const diff = await runDiffTier(pk, version);
       signals.push(...diff.signals);
       if (diff.failure) sourceFailures.push(diff.failure);
       if (diff.reached) tierReached = 'diff';
+
+      // The sandbox, for the same versions once the diff has added its signals:
+      // what static reading can't see (obfuscated or conditional code) shows up
+      // when the package is actually run. Optional: skipped when no runner is
+      // configured, and a runner failure is recorded, never "clean". It runs
+      // before the LLM review so the review is only ever a tiebreaker on top of
+      // what was actually observed.
+      const sandbox = await runSandboxTier(name, version);
+      signals.push(...sandbox.signals);
+      if (sandbox.failure) sourceFailures.push(sandbox.failure);
+      if (sandbox.reached) tierReached = 'sandbox';
+
+      // The LLM reads the code behind the diff signals. Skipped (undefined)
+      // when there is nothing to show it or no key is set; never throws.
+      review = (await reviewDiff({
+        label,
+        signalTitles: signals.filter((s) => s.severity !== 'info').map((s) => s.title),
+        hunks: diff.hunks,
+      })) ?? undefined;
     }
 
     // Strongest evidence first, so the reasons behind a verdict read well
     signals.sort((a, b) => SEVERITY_WEIGHT[b.severity] - SEVERITY_WEIGHT[a.severity]);
     const score = scoreOf(signals);
+    let outcome = verdictFor(signals, score, sourceFailures);
+    if (review && shouldLower(outcome, signals, sourceFailures, review) && review.status === 'ok') {
+      outcome = 'allow';
+      review.loweredVerdict = true;
+    }
     const verdict: PackageVerdict = {
       name, version, integrity: integrityOf(doc),
-      verdict: verdictFor(signals, score, sourceFailures),
+      verdict: outcome,
       score, signals, tierReached,
       analyzedAt: new Date(now).toISOString(),
       fromCache: false, sourceFailures,
       ...(allowlistedBy !== undefined ? { allowlistedBy } : {}),
+      ...(review ? { review } : {}),
     };
 
     // Cooldown-held verdicts are NOT cached: the hold exists precisely because
     // the version is brand-new, and the cached verdict must not outlive the
     // cooldown window. Once the version is old enough, the next call will re-run
     // the full analysis (without a too_new signal) and cache that clean result.
+    // A failed LLM review is not cached either: it is usually a rate limit or
+    // outage, so the next call retries.
     const hasCooldownSignal = signals.some((s) => s.type === 'too_new');
-    if (sourceFailures.length === 0 && !hasCooldownSignal) await writeCache(verdict);
+    if (sourceFailures.length === 0 && !hasCooldownSignal && review?.status !== 'failed') await writeCache(verdict);
 
     return verdict;
   } catch (err) {
